@@ -35,11 +35,13 @@ const recordSchema = new mongoose.Schema(
       trim: true,
       default: ''
     },
+    barcodes: {
+      type: [String],
+      default: []
+    },
     barcode: {
       type: String,
-      required: true,
-      trim: true,
-      index: true
+      trim: true
     },
     timestamp: {
       type: Date,
@@ -60,14 +62,27 @@ const recordSchema = new mongoose.Schema(
 
 const Record = mongoose.model('Record', recordSchema);
 
+// Helper function to extract barcode list from a record (backwards compatible)
+function getRecordBarcodes(r) {
+  if (Array.isArray(r.barcodes) && r.barcodes.length > 0) {
+    return r.barcodes.map((b) => String(b).trim()).filter(Boolean);
+  }
+  if (r.barcode && String(r.barcode).trim()) {
+    return [String(r.barcode).trim()];
+  }
+  return [];
+}
+
 // Helper function to compute duplicate vs unique stats
 function computeMetrics(records) {
   const frequencyMap = {};
   records.forEach((r) => {
-    const code = (r.barcode || '').trim();
-    if (code) {
-      frequencyMap[code] = (frequencyMap[code] || 0) + 1;
-    }
+    const list = getRecordBarcodes(r);
+    list.forEach((code) => {
+      if (code) {
+        frequencyMap[code] = (frequencyMap[code] || 0) + 1;
+      }
+    });
   });
 
   const totalRecords = records.length;
@@ -77,11 +92,17 @@ function computeMetrics(records) {
   let uniqueOnlyCount = 0;
 
   records.forEach((r) => {
-    const code = (r.barcode || '').trim();
-    const count = frequencyMap[code] || 0;
-    if (count > 1) {
+    const list = getRecordBarcodes(r);
+    let hasDup = false;
+    list.forEach((code) => {
+      if ((frequencyMap[code] || 0) > 1) {
+        hasDup = true;
+      }
+    });
+
+    if (hasDup) {
       duplicateEntries++;
-    } else if (count === 1) {
+    } else {
       uniqueOnlyCount++;
     }
   });
@@ -94,6 +115,41 @@ function computeMetrics(records) {
       duplicateEntries,
       uniqueOnlyCount
     }
+  };
+}
+
+// Enrich a single record with barcode details & duplicate counts
+function enrichRecord(r, frequencyMap) {
+  const list = getRecordBarcodes(r);
+  let uniqueCount = 0;
+  let duplicateCount = 0;
+
+  const barcodeDetails = list.map((code) => {
+    const count = frequencyMap[code] || 1;
+    const isDup = count > 1;
+    if (isDup) duplicateCount++;
+    else uniqueCount++;
+    return {
+      code,
+      count,
+      isDuplicate: isDup
+    };
+  });
+
+  const isDuplicate = duplicateCount > 0;
+
+  return {
+    id: r.id || (r._id ? r._id.toString() : ''),
+    name: r.name,
+    crNumber: r.crNumber || '',
+    barcodes: list,
+    barcode: list[0] || '',
+    barcodeDetails,
+    totalScans: list.length,
+    uniqueCount,
+    duplicateCount,
+    isDuplicate,
+    timestamp: r.timestamp || r.createdAt
   };
 }
 
@@ -120,26 +176,10 @@ app.get('/api/records', async (req, res) => {
   try {
     const rawRecords = await Record.find().sort({ createdAt: -1 }).lean();
 
-    // Map records with string id
-    const records = rawRecords.map((r) => ({
-      id: r._id.toString(),
-      name: r.name,
-      crNumber: r.crNumber || '',
-      barcode: r.barcode,
-      timestamp: r.timestamp || r.createdAt
-    }));
+    const { frequencyMap, stats } = computeMetrics(rawRecords);
 
-    const { frequencyMap, stats } = computeMetrics(records);
-
-    // Enrich records with occurrence count and duplicate flag
-    const enrichedRecords = records.map((r) => {
-      const count = frequencyMap[(r.barcode || '').trim()] || 1;
-      return {
-        ...r,
-        count,
-        isDuplicate: count > 1
-      };
-    });
+    // Enrich records with occurrence count, barcode details, and duplicate flags
+    const enrichedRecords = rawRecords.map((r) => enrichRecord(r, frequencyMap));
 
     res.json({
       records: enrichedRecords,
@@ -152,7 +192,7 @@ app.get('/api/records', async (req, res) => {
   }
 });
 
-// 3. Add New Entry (Single or Multiple Scans)
+// 3. Add New Patient Entry with all scanned barcodes in a single record
 app.post('/api/records', async (req, res) => {
   try {
     const { name, crNumber, barcode, barcodes } = req.body;
@@ -173,45 +213,27 @@ app.post('/api/records', async (req, res) => {
     const cleanName = String(name).trim();
     const cleanCrNumber = crNumber ? String(crNumber).trim() : '';
 
-    let hasAnyDuplicate = false;
-    const recordsToInsert = [];
+    // Create a SINGLE record containing the patient name, CR number, and all scanned barcodes
+    const newRecord = new Record({
+      name: cleanName,
+      crNumber: cleanCrNumber,
+      barcodes: barcodeList,
+      barcode: barcodeList[0] || '',
+      timestamp: new Date()
+    });
 
-    for (const code of barcodeList) {
-      const existingCount = await Record.countDocuments({ barcode: code });
-      if (existingCount > 0) hasAnyDuplicate = true;
-      recordsToInsert.push({
-        name: cleanName,
-        crNumber: cleanCrNumber,
-        barcode: code,
-        timestamp: new Date()
-      });
-    }
-
-    const savedRecords = await Record.insertMany(recordsToInsert);
+    const saved = await newRecord.save();
 
     // Get all records to re-compute updated stats
     const allRecords = await Record.find().sort({ createdAt: -1 }).lean();
-    const formattedRecords = allRecords.map((r) => ({
-      id: r._id.toString(),
-      name: r.name,
-      crNumber: r.crNumber || '',
-      barcode: r.barcode,
-      timestamp: r.timestamp || r.createdAt
-    }));
+    const { frequencyMap, stats } = computeMetrics(allRecords);
 
-    const { stats } = computeMetrics(formattedRecords);
+    const enrichedSaved = enrichRecord(saved.toJSON(), frequencyMap);
 
     res.status(201).json({
       success: true,
-      records: savedRecords.map((r) => ({
-        id: r._id.toString(),
-        name: r.name,
-        crNumber: r.crNumber,
-        barcode: r.barcode,
-        timestamp: r.timestamp
-      })),
-      isDuplicate: hasAnyDuplicate,
-      count: savedRecords.length,
+      record: enrichedSaved,
+      isDuplicate: enrichedSaved.isDuplicate,
       stats
     });
   } catch (err) {
@@ -220,14 +242,22 @@ app.post('/api/records', async (req, res) => {
   }
 });
 
-// 4. Update Entry (Edit Name, CR Number, or Barcode)
+// 4. Update Entry (Edit Name, CR Number, or Barcodes)
 app.put('/api/records/:id', async (req, res) => {
   try {
     const { id } = req.params;
-    const { name, crNumber, barcode } = req.body;
+    const { name, crNumber, barcode, barcodes } = req.body;
 
-    if (!name || !barcode) {
-      return res.status(400).json({ error: 'Name and Barcode are required.' });
+    let barcodeList = [];
+    if (Array.isArray(barcodes)) {
+      barcodeList = barcodes.map((b) => String(b).trim()).filter(Boolean);
+    } else if (barcode) {
+      const clean = String(barcode).trim();
+      if (clean) barcodeList.push(clean);
+    }
+
+    if (!name || barcodeList.length === 0) {
+      return res.status(400).json({ error: 'Name and at least one Barcode are required.' });
     }
 
     const updated = await Record.findByIdAndUpdate(
@@ -235,7 +265,8 @@ app.put('/api/records/:id', async (req, res) => {
       {
         name: String(name).trim(),
         crNumber: crNumber !== undefined ? String(crNumber).trim() : '',
-        barcode: String(barcode).trim()
+        barcodes: barcodeList,
+        barcode: barcodeList[0] || ''
       },
       { new: true }
     );
@@ -246,25 +277,14 @@ app.put('/api/records/:id', async (req, res) => {
 
     // Get updated metrics
     const allRecords = await Record.find().lean();
-    const formattedRecords = allRecords.map((r) => ({
-      id: r._id.toString(),
-      name: r.name,
-      crNumber: r.crNumber || '',
-      barcode: r.barcode,
-      timestamp: r.timestamp || r.createdAt
-    }));
-    const { stats } = computeMetrics(formattedRecords);
+    const { frequencyMap, stats } = computeMetrics(allRecords);
+
+    const enrichedUpdated = enrichRecord(updated.toJSON(), frequencyMap);
 
     res.json({
       success: true,
       message: 'Record updated successfully.',
-      record: {
-        id: updated._id.toString(),
-        name: updated.name,
-        crNumber: updated.crNumber,
-        barcode: updated.barcode,
-        timestamp: updated.timestamp
-      },
+      record: enrichedUpdated,
       stats
     });
   } catch (err) {

@@ -30,6 +30,11 @@ const recordSchema = new mongoose.Schema(
       required: true,
       trim: true
     },
+    crNumber: {
+      type: String,
+      trim: true,
+      default: ''
+    },
     barcode: {
       type: String,
       required: true,
@@ -119,6 +124,7 @@ app.get('/api/records', async (req, res) => {
     const records = rawRecords.map((r) => ({
       id: r._id.toString(),
       name: r.name,
+      crNumber: r.crNumber || '',
       barcode: r.barcode,
       timestamp: r.timestamp || r.createdAt
     }));
@@ -146,33 +152,49 @@ app.get('/api/records', async (req, res) => {
   }
 });
 
-// 3. Add New Entry
+// 3. Add New Entry (Single or Multiple Scans)
 app.post('/api/records', async (req, res) => {
   try {
-    const { name, barcode } = req.body;
-    if (!name || !barcode) {
-      return res.status(400).json({ error: 'Name and Barcode are required.' });
+    const { name, crNumber, barcode, barcodes } = req.body;
+
+    // Normalize barcodes list
+    let barcodeList = [];
+    if (Array.isArray(barcodes)) {
+      barcodeList = barcodes.map((b) => String(b).trim()).filter(Boolean);
+    } else if (barcode) {
+      const clean = String(barcode).trim();
+      if (clean) barcodeList.push(clean);
+    }
+
+    if (!name || barcodeList.length === 0) {
+      return res.status(400).json({ error: 'Name and at least one Barcode are required.' });
     }
 
     const cleanName = String(name).trim();
-    const cleanBarcode = String(barcode).trim();
+    const cleanCrNumber = crNumber ? String(crNumber).trim() : '';
 
-    // Check existing count in MongoDB
-    const existingCount = await Record.countDocuments({ barcode: cleanBarcode });
+    let hasAnyDuplicate = false;
+    const recordsToInsert = [];
 
-    const newRecord = new Record({
-      name: cleanName,
-      barcode: cleanBarcode,
-      timestamp: new Date()
-    });
+    for (const code of barcodeList) {
+      const existingCount = await Record.countDocuments({ barcode: code });
+      if (existingCount > 0) hasAnyDuplicate = true;
+      recordsToInsert.push({
+        name: cleanName,
+        crNumber: cleanCrNumber,
+        barcode: code,
+        timestamp: new Date()
+      });
+    }
 
-    const saved = await newRecord.save();
+    const savedRecords = await Record.insertMany(recordsToInsert);
 
     // Get all records to re-compute updated stats
     const allRecords = await Record.find().sort({ createdAt: -1 }).lean();
     const formattedRecords = allRecords.map((r) => ({
       id: r._id.toString(),
       name: r.name,
+      crNumber: r.crNumber || '',
       barcode: r.barcode,
       timestamp: r.timestamp || r.createdAt
     }));
@@ -181,15 +203,15 @@ app.post('/api/records', async (req, res) => {
 
     res.status(201).json({
       success: true,
-      record: {
-        id: saved._id.toString(),
-        name: saved.name,
-        barcode: saved.barcode,
-        timestamp: saved.timestamp,
-        count: existingCount + 1,
-        isDuplicate: existingCount > 0
-      },
-      isDuplicate: existingCount > 0,
+      records: savedRecords.map((r) => ({
+        id: r._id.toString(),
+        name: r.name,
+        crNumber: r.crNumber,
+        barcode: r.barcode,
+        timestamp: r.timestamp
+      })),
+      isDuplicate: hasAnyDuplicate,
+      count: savedRecords.length,
       stats
     });
   } catch (err) {
@@ -198,11 +220,11 @@ app.post('/api/records', async (req, res) => {
   }
 });
 
-// 4. Update Entry (Edit Name or Barcode)
+// 4. Update Entry (Edit Name, CR Number, or Barcode)
 app.put('/api/records/:id', async (req, res) => {
   try {
     const { id } = req.params;
-    const { name, barcode } = req.body;
+    const { name, crNumber, barcode } = req.body;
 
     if (!name || !barcode) {
       return res.status(400).json({ error: 'Name and Barcode are required.' });
@@ -212,6 +234,7 @@ app.put('/api/records/:id', async (req, res) => {
       id,
       {
         name: String(name).trim(),
+        crNumber: crNumber !== undefined ? String(crNumber).trim() : '',
         barcode: String(barcode).trim()
       },
       { new: true }
@@ -226,6 +249,7 @@ app.put('/api/records/:id', async (req, res) => {
     const formattedRecords = allRecords.map((r) => ({
       id: r._id.toString(),
       name: r.name,
+      crNumber: r.crNumber || '',
       barcode: r.barcode,
       timestamp: r.timestamp || r.createdAt
     }));
@@ -237,6 +261,7 @@ app.put('/api/records/:id', async (req, res) => {
       record: {
         id: updated._id.toString(),
         name: updated.name,
+        crNumber: updated.crNumber,
         barcode: updated.barcode,
         timestamp: updated.timestamp
       },

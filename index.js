@@ -192,7 +192,7 @@ app.get('/api/records', async (req, res) => {
   }
 });
 
-// 3. Add New Patient Entry with all scanned barcodes in a single record
+// 3. Add New Patient Entry with all scanned barcodes in a single record (or group by CR Number if exists)
 app.post('/api/records', async (req, res) => {
   try {
     const { name, crNumber, barcode, barcodes } = req.body;
@@ -213,25 +213,57 @@ app.post('/api/records', async (req, res) => {
     const cleanName = String(name).trim();
     const cleanCrNumber = crNumber ? String(crNumber).trim() : '';
 
-    // Create a SINGLE record containing the patient name, CR number, and all scanned barcodes
-    const newRecord = new Record({
-      name: cleanName,
-      crNumber: cleanCrNumber,
-      barcodes: barcodeList,
-      barcode: barcodeList[0] || '',
-      timestamp: new Date()
-    });
+    let recordToReturn;
+    let isMerged = false;
 
-    const saved = await newRecord.save();
+    // If CR Number is provided, check if a record with the same CR Number already exists
+    if (cleanCrNumber) {
+      const escapedCr = cleanCrNumber.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const existingRecord = await Record.findOne({
+        crNumber: { $regex: new RegExp(`^${escapedCr}$`, 'i') }
+      });
+
+      if (existingRecord) {
+        // Group / mix newly scanned barcodes into existing record
+        const existingBarcodes = getRecordBarcodes(existingRecord);
+        const combinedBarcodes = [...existingBarcodes, ...barcodeList];
+
+        existingRecord.barcodes = combinedBarcodes;
+        existingRecord.barcode = combinedBarcodes[0] || '';
+        if (cleanName && cleanName !== existingRecord.name) {
+          existingRecord.name = cleanName;
+        }
+        existingRecord.timestamp = new Date();
+
+        const saved = await existingRecord.save();
+        recordToReturn = saved;
+        isMerged = true;
+      }
+    }
+
+    if (!isMerged) {
+      // Create a SINGLE record containing the patient name, CR number, and all scanned barcodes
+      const newRecord = new Record({
+        name: cleanName,
+        crNumber: cleanCrNumber,
+        barcodes: barcodeList,
+        barcode: barcodeList[0] || '',
+        timestamp: new Date()
+      });
+
+      const saved = await newRecord.save();
+      recordToReturn = saved;
+    }
 
     // Get all records to re-compute updated stats
     const allRecords = await Record.find().sort({ createdAt: -1 }).lean();
     const { frequencyMap, stats } = computeMetrics(allRecords);
 
-    const enrichedSaved = enrichRecord(saved.toJSON(), frequencyMap);
+    const enrichedSaved = enrichRecord(recordToReturn.toJSON(), frequencyMap);
 
     res.status(201).json({
       success: true,
+      merged: isMerged,
       record: enrichedSaved,
       isDuplicate: enrichedSaved.isDuplicate,
       stats
